@@ -258,22 +258,32 @@ class SNGrazDataCoordinator(DataUpdateCoordinator):
 
             # HA statistics finest interval is hourly, so let's break it down by hour
             # Also, do some filtering afterwards, pandas otherwise creates "empty" rows
-            df = pandas.DataFrame(_data)
+            df = pandas.DataFrame(_data or [])
+            # The portal does not always deliver both values (e.g. meter readings
+            # can be missing for recent days), so only aggregate what is there.
+            # count()/sum()/max() skip the NaN gaps of readings lacking a value.
+            aggregations = {
+                "CONSUMP": lambda x: numpy.nan if x.count() == 0 else x.sum(),
+                "MR": lambda x: numpy.nan if x.count() == 0 else x.max(),
+            }
+            aggregations = {k: v for k, v in aggregations.items() if k in df.columns}
+            if "readTime" not in df.columns or not aggregations:
+                _LOGGER.warning(
+                    f"no consumption or meter reading values for {meter._short_name}"
+                )
+                continue
             # The binning to full hours will attribute readings at full hours e.g. 9:00 to the bin of 9:00-10:00
             # However the consumption actually belongs to the 8:00-9:00 bin.
             # Strictly speaking, the same applies for any binning and reading interval
             df["readTime"] = df["readTime"] - timedelta(seconds=1)
             df_hour = (
                 df.groupby(pandas.Grouper(freq="h", key="readTime"))
-                .agg(
-                    {
-                        "CONSUMP": lambda x: numpy.nan if len(x) == 0 else sum(x),
-                        "MR": lambda x: numpy.nan if len(x) == 0 else max(x),
-                    }
-                )
+                .agg(aggregations)
                 .dropna(how="all")
             )
             df_dict = df_hour.to_dict(orient="index")
+            if not df_dict:
+                continue
 
             start = list(df_dict.keys())[0].to_pydatetime() - timedelta(hours=1)
             stat = await get_instance(self.hass).async_add_executor_job(
@@ -302,15 +312,17 @@ class SNGrazDataCoordinator(DataUpdateCoordinator):
             statistics = []
             last_reading = _sum
             for start, data in df_dict.items():
-                if "CONSUMP" not in data or "MR" not in data:
-                    continue
+                consump = data.get("CONSUMP")
+                mr = data.get("MR")
+                has_mr = bool(mr) and mr == mr  # x != x is a NaN check.
+                has_consump = bool(consump) and consump == consump
 
-                consump = data["CONSUMP"]
-                mr = data["MR"]
-                if not mr or mr != mr:  # x != x is a NaN check.
-                    continue
-
-                if not consump or consump != consump:
+                if not has_mr:
+                    # Without a meter reading only the consumption can be used,
+                    # and only when the sum is not derived from a base reading.
+                    if not has_consump or base_reading != 0:
+                        continue
+                elif not has_consump:
                     if (
                         base_reading == 0
                     ):  # sum is too unreliable if we don't have base_reading
